@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"fmt"
+	"log"
 
 	"boot.dev/linko/internal/store"
 	"golang.org/x/crypto/bcrypt"
@@ -118,4 +119,13 @@ func (s *server) handlerStats(w http.ResponseWriter, _ *http.Request) {
 		"redirects":   len(snapshot),
 		"bytes_saved": bytesSaved,
 	})
+}
+
+func requestLogger(logger *log.Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			next.ServeHTTP(w, r)
+			logger.Printf("Served request: %s %s", r.Method, r.URL.Path)
+		})
+	}
 }

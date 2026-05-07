@@ -29,11 +29,16 @@ func main() {
 }
 
 func run(ctx context.Context, cancel context.CancelFunc, httpPort int, dataDir string) int {
-	logger, err := initializeLogger(os.Getenv("LINKO_LOG_FILE"))
+	logger, closeLogger, err := initializeLogger(os.Getenv("LINKO_LOG_FILE"))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to initialize logger: %v\n", err)
 		return 1
 	}
+	defer func() {
+		if err := closeLogger(); err != nil {
+			fmt.Fprintf(os.Stderr, "logger cleanup error: %v\n", err)
+		}
+	}()
 
 	st, err := store.New(dataDir, logger)
 	if err != nil {
@@ -64,16 +69,29 @@ func run(ctx context.Context, cancel context.CancelFunc, httpPort int, dataDir s
 	return 0
 }
 
-func initializeLogger(logFile string) (*log.Logger, error) {
+type closeFunc func() error
+
+func initializeLogger(logFile string) (*log.Logger, closeFunc, error) {
 	if logFile != ""  {
 		file, err := os.OpenFile(logFile, os.O_RDWR | os.O_CREATE | os.O_APPEND, 0644)
 		if err != nil {
-			return nil, fmt.Errorf("failed to open logger file: %s", err)
+			return nil, nil, fmt.Errorf("failed to open logger file: %s", err)
 		}
 
-		multiWriter := bufio.NewWriterSize(io.MultiWriter(os.Stderr, file), 8192)
-		return log.New(multiWriter, "", log.LstdFlags), nil
+		bufferedWriter := bufio.NewWriterSize(io.MultiWriter(os.Stderr, file), 8192)
+		cleanup := func() error {
+			if flushErr := bufferedWriter.Flush(); flushErr != nil {
+				file.Close()
+				return fmt.Errorf("failed to flush buffer: %w", flushErr)
+			}
+			if closeErr := file.Close(); closeErr != nil {
+				return fmt.Errorf("failed to close file: %w", closeErr)
+			}
+			return nil
+		}
+
+		return log.New(bufferedWriter, "", log.LstdFlags), cleanup, nil
 	}
 
-	return log.New(os.Stderr, "", log.LstdFlags), nil
+	return log.New(os.Stderr, "", log.LstdFlags), func() error { return nil }, nil
 }

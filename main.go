@@ -14,6 +14,8 @@ import (
 	"errors"
 	pkgerr "github.com/pkg/errors"
 
+	linkoerr "boot.dev/linko/internal"
+
 	"boot.dev/linko/internal/store"
 )
 
@@ -116,23 +118,66 @@ type stackTracer interface {
 	StackTrace() pkgerr.StackTrace
 }
 
+type multiError interface {
+	error
+	Unwrap() []error
+}
+
 func replaceAttr(groups []string, a slog.Attr) slog.Attr {
 	if a.Key == "error" {
-		err, ok := a.Value.Any().(error)
+		errObj, ok := a.Value.Any().(error)
 		if !ok {
 			return a
 		}
 
-		if stackErr, ok := errors.AsType[stackTracer](err); ok {
-			return slog.GroupAttrs("error", slog.Attr{
-				Key:   "message",
-				Value: slog.StringValue(stackErr.Error()),
-			}, slog.Attr{
-				Key:   "stack_trace",
-				Value: slog.StringValue(fmt.Sprintf("%+v", stackErr.StackTrace())),
-			})
+		var multiErr multiError
+		if errors.As(errObj, &multiErr) {
+			unwrappedErrs := multiErr.Unwrap()
+
+			var multiGroupArgs []slog.Attr
+
+			for i, singleErr := range unwrappedErrs {
+				extractedAttrs := errorAttrs(singleErr)
+
+				errorKey := fmt.Sprintf("error_%d", i+1)
+
+				multiGroupArgs = append(multiGroupArgs, slog.Attr{
+					Key:   errorKey,
+					Value: slog.GroupValue(extractedAttrs...),
+				})
+			}
+
+			return slog.Attr{
+				Key:   "errors",
+				Value: slog.GroupValue(multiGroupArgs...),
+			}
+		}
+
+		extractedAttrs := errorAttrs(errObj)
+		return slog.Attr{
+			Key:   "error",
+			Value: slog.GroupValue(extractedAttrs...),
 		}
 	}
 
 	return a
+}
+
+func errorAttrs(errObj error) []slog.Attr {
+	// 1. Always grab the base error message
+	attrs := []slog.Attr{
+		slog.String("message", errObj.Error()),
+	}
+
+	// 2. Check for a stack trace
+	var stackErr stackTracer
+	if errors.As(errObj, &stackErr) {
+		attrs = append(attrs, slog.String("stack_trace", fmt.Sprintf("%+v", stackErr.StackTrace())))
+	}
+
+	// 3. Extract any custom attributes (like "path": "data/bad_entry")
+	customAttrs := linkoerr.Attrs(errObj)
+	attrs = append(attrs, customAttrs...)
+
+	return attrs
 }

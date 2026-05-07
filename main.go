@@ -42,7 +42,7 @@ func run(ctx context.Context, cancel context.CancelFunc, httpPort int, dataDir s
 
 	st, err := store.New(dataDir, logger)
 	if err != nil {
-		logger.Info(fmt.Sprintf("failed to create store: %v", err))
+		logger.Error(fmt.Sprintf("failed to create store: %v", err))
 		return 1
 	}
 	s := newServer(*st, httpPort, cancel, logger)
@@ -51,19 +51,19 @@ func run(ctx context.Context, cancel context.CancelFunc, httpPort int, dataDir s
 		serverErr = s.start()
 	}()
 
-	logger.Info(fmt.Sprintf("Linko is running on http://localhost:%d", httpPort))
+	logger.Debug(fmt.Sprintf("Linko is running on http://localhost:%d", httpPort))
 
 	<-ctx.Done()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	logger.Info("Linko is shutting down")
+	logger.Debug("Linko is shutting down")
 	defer cancel()
 
 	if err := s.shutdown(shutdownCtx); err != nil {
-		logger.Info(fmt.Sprintf("failed to shutdown server: %v\n", err))
+		logger.Error(fmt.Sprintf("failed to shutdown server: %v\n", err))
 		return 1
 	}
 	if serverErr != nil {
-		logger.Info(fmt.Sprintf("server error: %v\n", serverErr))
+		logger.Error(fmt.Sprintf("server error: %v\n", serverErr))
 		return 1
 	}
 	return 0
@@ -72,6 +72,10 @@ func run(ctx context.Context, cancel context.CancelFunc, httpPort int, dataDir s
 type closeFunc func() error
 
 func initializeLogger(logFile string) (*slog.Logger, closeFunc, error) {
+	debugHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	})
+
 	if logFile != ""  {
 		file, err := os.OpenFile(logFile, os.O_RDWR | os.O_CREATE | os.O_APPEND, 0644)
 		if err != nil {
@@ -90,8 +94,16 @@ func initializeLogger(logFile string) (*slog.Logger, closeFunc, error) {
 			return nil
 		}
 
-		return slog.New(slog.NewTextHandler(bufferedWriter, nil)), cleanup, nil
+		infoHandler := slog.NewTextHandler(bufferedWriter, &slog.HandlerOptions{
+			Level: slog.LevelInfo,
+		})
+
+
+		return slog.New(slog.NewMultiHandler(
+			debugHandler,
+			infoHandler,
+		)), cleanup, nil
 	}
 
-	return slog.New(slog.NewTextHandler(os.Stderr, nil)), nil, nil
+	return slog.New(debugHandler), nil, nil
 }

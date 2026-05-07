@@ -3,10 +3,10 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net"
 	"net/http"
 	"os"
+	"fmt"
 
 	"boot.dev/linko/internal/store"
 )

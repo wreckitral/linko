@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
+	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -26,40 +29,51 @@ func main() {
 }
 
 func run(ctx context.Context, cancel context.CancelFunc, httpPort int, dataDir string) int {
-	accessLoggerFile, err := os.OpenFile("linko.access.log", os.O_RDWR | os.O_CREATE | os.O_APPEND, 0666)
+	logger, err := initializeLogger(os.Getenv("LINKO_LOG_FILE"))
 	if err != nil {
-		log.Printf("failed to open logger file: %s", err)
-	}
-	defer accessLoggerFile.Close()
-
-	accessLogger := log.New(accessLoggerFile, "INFO: ", log.LstdFlags)
-	standardLogger := log.New(os.Stderr, "DEBUG: ", log.LstdFlags)
-
-	st, err := store.New(dataDir, standardLogger)
-	if err != nil {
-		standardLogger.Printf("failed to create store: %v", err)
+		fmt.Fprintf(os.Stderr, "failed to initialize logger: %v\n", err)
 		return 1
 	}
-	s := newServer(*st, httpPort, cancel, accessLogger)
+
+	st, err := store.New(dataDir, logger)
+	if err != nil {
+		logger.Printf("failed to create store: %v", err)
+		return 1
+	}
+	s := newServer(*st, httpPort, cancel, logger)
 	var serverErr error
 	go func() {
 		serverErr = s.start()
 	}()
 
-	standardLogger.Printf("Linko is running on http://localhost:%d", httpPort)
+	logger.Printf("Linko is running on http://localhost:%d", httpPort)
 
 	<-ctx.Done()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	standardLogger.Print("Linko is shutting down")
+	logger.Print("Linko is shutting down")
 	defer cancel()
 
 	if err := s.shutdown(shutdownCtx); err != nil {
-		standardLogger.Printf("failed to shutdown server: %v\n", err)
+		logger.Printf("failed to shutdown server: %v\n", err)
 		return 1
 	}
 	if serverErr != nil {
-		accessLogger.Printf("server error: %v\n", serverErr)
+		logger.Printf("server error: %v\n", serverErr)
 		return 1
 	}
 	return 0
+}
+
+func initializeLogger(logFile string) (*log.Logger, error) {
+	if logFile != ""  {
+		file, err := os.OpenFile(logFile, os.O_RDWR | os.O_CREATE | os.O_APPEND, 0644)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open logger file: %s", err)
+		}
+
+		multiWriter := bufio.NewWriterSize(io.MultiWriter(os.Stderr, file), 8192)
+		return log.New(multiWriter, "", log.LstdFlags), nil
+	}
+
+	return log.New(os.Stderr, "", log.LstdFlags), nil
 }

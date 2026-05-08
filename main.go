@@ -1,21 +1,23 @@
 package main
 
 import (
-	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
-	"errors"
-	pkgerr "github.com/pkg/errors"
 
 	linkoerr "boot.dev/linko/internal"
+	"github.com/lmittmann/tint"
+	"github.com/mattn/go-isatty"
+	pkgerr "github.com/pkg/errors"
+	"gopkg.in/natefinch/lumberjack.v2"
 
+	"boot.dev/linko/internal/build"
 	"boot.dev/linko/internal/store"
 )
 
@@ -34,6 +36,20 @@ func main() {
 
 func run(ctx context.Context, cancel context.CancelFunc, httpPort int, dataDir string) int {
 	logger, closeLogger, err := initializeLogger(os.Getenv("LINKO_LOG_FILE"))
+	env := os.Getenv("ENV")
+	hostname, err := os.Hostname()
+	if err != nil {
+		logger.Error(fmt.Sprintf("failed to get hostname: %v", err))
+		return 1
+	}
+
+	logger = logger.With(
+		slog.String("git_sha", build.GitSHA),
+		slog.String("build_time", build.BuildTime),
+		slog.String("env", env),
+		slog.String("hostname", hostname),
+	)
+
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to initialize logger: %v\n", err)
 		return 1
@@ -76,41 +92,50 @@ func run(ctx context.Context, cancel context.CancelFunc, httpPort int, dataDir s
 type closeFunc func() error
 
 func initializeLogger(logFile string) (*slog.Logger, closeFunc, error) {
-	debugHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		Level: slog.LevelDebug,
+	var (
+		handlers []slog.Handler
+		closers []closeFunc
+	)
+
+	fd := os.Stdout.Fd()
+	isTTY := isatty.IsTerminal(fd) || isatty.IsCygwinTerminal(fd)
+
+	handlers = append(handlers, tint.NewHandler(os.Stderr, &tint.Options{
 		ReplaceAttr: replaceAttr,
-	})
+		NoColor: !isTTY,
+	}))
 
 	if logFile != ""  {
-		file, err := os.OpenFile(logFile, os.O_RDWR | os.O_CREATE | os.O_APPEND, 0644)
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to open logger file: %s", err)
+		logger := &lumberjack.Logger{
+			Filename:   logFile,
+			MaxSize:    1,
+			MaxAge:     28,
+			MaxBackups: 10,
+			LocalTime:  false,
+			Compress:   true,
 		}
 
-		bufferedWriter := bufio.NewWriterSize(io.MultiWriter(os.Stderr, file), 8192)
-		cleanup := func() error {
-			if flushErr := bufferedWriter.Flush(); flushErr != nil {
-				file.Close()
-				return fmt.Errorf("failed to flush buffer: %w", flushErr)
-			}
-			if closeErr := file.Close(); closeErr != nil {
-				return fmt.Errorf("failed to close file: %w", closeErr)
-			}
-			return nil
-		}
-
-		infoHandler := slog.NewJSONHandler(bufferedWriter, &slog.HandlerOptions{
-			Level: slog.LevelInfo,
+		handlers = append(handlers, slog.NewJSONHandler(logger, &slog.HandlerOptions{
 			ReplaceAttr: replaceAttr,
-		})
+		}))
+		closers = append(closers, func() error {
+			if err := logger.Close(); err != nil {
+				return err
+			}
 
-		return slog.New(slog.NewMultiHandler(
-			debugHandler,
-			infoHandler,
-		)), cleanup, nil
+			return nil
+		})
 	}
 
-	return slog.New(debugHandler), nil, nil
+	close := func() error {
+		var errs []error
+		for _, closer := range closers {
+			errs = append(errs, closer())
+		}
+		return errors.Join(errs...)
+	}
+
+	return slog.New(slog.NewMultiHandler(handlers...)), close, nil
 }
 
 type stackTracer interface {

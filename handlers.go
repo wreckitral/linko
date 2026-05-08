@@ -1,18 +1,21 @@
 package main
 
 import (
+	"context"
+	"crypto/rand"
 	_ "embed"
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
-	"fmt"
-	"log/slog"
+	"time"
 
 	"boot.dev/linko/internal/store"
+	pkgerr "github.com/pkg/errors"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -38,80 +41,80 @@ func (s *server) handlerLogin(w http.ResponseWriter, r *http.Request) {
 func (s *server) handlerShortenLink(w http.ResponseWriter, r *http.Request) {
 	user, ok := r.Context().Value(UserContextKey).(string)
 	if !ok || user == "" {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		httpError(r.Context(), w, http.StatusUnauthorized, errors.New("unauthorized"))
 		return
 	}
 
 	longURL := r.FormValue("url")
 	if longURL == "" {
-		http.Error(w, "missing url parameter", http.StatusBadRequest)
+		httpError(r.Context(), w, http.StatusBadRequest, errors.New("invalid URL"))
 		return
 	}
 
 	u, err := url.Parse(longURL)
 	if err != nil || u.Scheme == "" || u.Host == "" {
-		http.Error(w, "invalid URL: must include scheme (http/https) and host", http.StatusBadRequest)
+		httpError(r.Context(), w, http.StatusBadRequest, errors.New("invalid URL"))
 		return
 	}
 
 	if err := checkDestination(longURL); err != nil {
-		http.Error(w, fmt.Sprintf("invalid target URL: %v", err), http.StatusBadRequest)
+		httpError(r.Context(), w, http.StatusBadRequest, errors.New("invalid URL"))
 		return
 	}
 
 	shortCode, err := s.store.Create(r.Context(), longURL)
 	if err != nil {
-		http.Error(w, "failed to shorten URL", http.StatusInternalServerError)
+		httpError(r.Context(), w, http.StatusInternalServerError, errors.New("internal server error"))
 		return
 	}
 
 	s.logger.Info("Successfully generated short code",
-		"shortCode", shortCode,
-		"url", "longURL",
-	)
-	w.Header().Set("Content-Type", "text/plain")
-	w.WriteHeader(http.StatusCreated)
-	io.WriteString(w, shortCode)
+	"shortCode", shortCode,
+	"url", "longURL",
+)
+w.Header().Set("Content-Type", "text/plain")
+w.WriteHeader(http.StatusCreated)
+io.WriteString(w, shortCode)
 }
 
 func (s *server) handlerRedirect(w http.ResponseWriter, r *http.Request) {
 	longURL, err := s.store.Lookup(r.Context(), r.PathValue("shortCode"))
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			http.Error(w, "not found", http.StatusNotFound)
+			httpError(r.Context(), w, http.StatusNotFound, errors.New("not found"))
 		} else {
 			s.logger.Error("failed to lookup URL",
-				"error", err,
-			)
-			http.Error(w, "internal server error", http.StatusInternalServerError)
-		}
-		return
+			"error", err,
+		)
+		httpError(r.Context(), w, http.StatusInternalServerError, errors.New("internal server error"))
 	}
-	_, _ = bcrypt.GenerateFromPassword([]byte(longURL), bcrypt.DefaultCost)
-	if err := checkDestination(longURL); err != nil {
-		http.Error(w, "destination unavailable", http.StatusBadGateway)
-		return
-	}
+	return
+}
+_, _ = bcrypt.GenerateFromPassword([]byte(longURL), bcrypt.DefaultCost)
+if err := checkDestination(longURL); err != nil {
+	httpError(r.Context(), w, http.StatusBadGateway, errors.New("bad gateway"))
+	return
+}
 
-	redirectsMu.Lock()
-	redirects = append(redirects, strings.Repeat(longURL, 1024))
-	redirectsMu.Unlock()
+redirectsMu.Lock()
+redirects = append(redirects, strings.Repeat(longURL, 1024))
+redirectsMu.Unlock()
 
-	http.Redirect(w, r, longURL, http.StatusFound)
+http.Redirect(w, r, longURL, http.StatusFound)
 }
 
 func (s *server) handlerListURLs(w http.ResponseWriter, r *http.Request) {
 	codes, err := s.store.List(r.Context())
 	if err != nil {
 		s.logger.Error("failed to list URLs",
-			"error", err,
-		)
-		http.Error(w, "failed to list URLs", http.StatusInternalServerError)
-		return
-	}
+		"error", err,
+	)
+	httpError(r.Context(), w, http.StatusInternalServerError, errors.New("internal server error"))
+	return
+}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(codes)
+w.Header().Set("Content-Type", "application/json")
+json.NewEncoder(w).Encode(codes)
 }
 
 func (s *server) handlerStats(w http.ResponseWriter, _ *http.Request) {
@@ -131,15 +134,108 @@ func (s *server) handlerStats(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
+const logContextKey contextKey = "log_context"
+
+type LogContext struct {
+	Username string
+	Error error
+}
+
 func requestLogger(logger *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			next.ServeHTTP(w, r)
-			logger.Info("Served request",
+			logCtx := &LogContext{}
+			ctx := context.WithValue(r.Context(), logContextKey, logCtx)
+			r = r.WithContext(ctx)
+
+			reqId := r.Header.Get("X-Request-ID")
+
+			spyWriter := &spyResponseWriter{ResponseWriter: w}
+			spyReader := &spyReadCloser{ReadCloser: r.Body}
+			r.Body = spyReader
+			start := time.Now()
+
+			next.ServeHTTP(spyWriter, r)
+
+			logArgs := []any{
 				"method", r.Method,
 				"path", r.URL.Path,
 				"client_ip", r.RemoteAddr,
-			)
+				slog.Duration("duration", time.Since(start)),
+				slog.Int("request_body_bytes", spyReader.bytesRead),
+				slog.Int("response_status", spyWriter.statusCode),
+				slog.Int("response_body_bytes", spyWriter.bytesWritten),
+				slog.String("request_id", reqId),
+			}
+
+			if logCtx.Username != "" {
+				logArgs = append(logArgs, slog.String("user", logCtx.Username))
+			}
+
+			if logCtx.Error != nil {
+				logArgs = append(logArgs, slog.Any("error", logCtx.Error))
+			}
+
+			logger.Info("Served request", logArgs...)
 		})
 	}
+}
+
+func httpError(ctx context.Context, w http.ResponseWriter, status int, err error) {
+	if logCtx, ok := ctx.Value(logContextKey).(*LogContext); ok {
+		logCtx.Error = pkgerr.WithStack(err)
+	}
+
+	msg := err.Error()
+	if status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusInternalServerError {
+		msg = http.StatusText(status)
+	}
+
+	http.Error(w, msg, status)
+}
+
+func requestId(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestId := r.Header.Get("X-Request-ID")
+		if requestId == "" {
+			requestId = rand.Text()
+		}
+
+		w.Header().Set("X-Request-ID", requestId)
+
+		r.Header.Set("X-Request-ID", requestId)
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+type spyResponseWriter struct {
+	http.ResponseWriter
+	bytesWritten int
+	statusCode   int
+}
+
+func (w *spyResponseWriter) Write(p []byte) (int, error) {
+	if w.statusCode == 0 {
+		w.statusCode = http.StatusOK
+	}
+	n, err := w.ResponseWriter.Write(p)
+	w.bytesWritten += n
+	return n, err
+}
+
+func (w *spyResponseWriter) WriteHeader(statusCode int) {
+	w.statusCode = statusCode
+	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+type spyReadCloser struct {
+	io.ReadCloser
+	bytesRead int
+}
+
+func (r *spyReadCloser) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	r.bytesRead += n
+	return n, err
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log"
 	"log/slog"
 	"net/url"
 	"os"
@@ -21,6 +22,11 @@ import (
 
 	"boot.dev/linko/internal/build"
 	"boot.dev/linko/internal/store"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
 func main() {
@@ -37,7 +43,28 @@ func main() {
 }
 
 func run(ctx context.Context, cancel context.CancelFunc, httpPort int, dataDir string) int {
+	shutdownTracing, err := initTracing(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to initialize tracing: %v\n", err)
+		return 1
+	}
+	defer func() {
+		if err := shutdownTracing(context.Background()); err != nil {
+			log.Printf("failed to shutdown TracerProvider: %v", err)
+		}
+	}()
+
 	logger, closeLogger, err := initializeLogger(os.Getenv("LINKO_LOG_FILE"))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to initialize logger: %v\n", err)
+		return 1
+	}
+	defer func() {
+		if err := closeLogger(); err != nil {
+			fmt.Fprintf(os.Stderr, "logger cleanup error: %v\n", err)
+		}
+	}()
+
 	env := os.Getenv("ENV")
 	hostname, err := os.Hostname()
 	if err != nil {
@@ -51,16 +78,6 @@ func run(ctx context.Context, cancel context.CancelFunc, httpPort int, dataDir s
 		slog.String("env", env),
 		slog.String("hostname", hostname),
 	)
-
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to initialize logger: %v\n", err)
-		return 1
-	}
-	defer func() {
-		if err := closeLogger(); err != nil {
-			fmt.Fprintf(os.Stderr, "logger cleanup error: %v\n", err)
-		}
-	}()
 
 	st, err := store.New(dataDir, logger)
 	if err != nil {
@@ -205,6 +222,23 @@ func replaceAttr(groups []string, a slog.Attr) slog.Attr {
 	return a
 }
 
+func initTracing(ctx context.Context) (func(context.Context) error, error) {
+	exp, err := otlptracegrpc.New(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exp,
+			sdktrace.WithBatchTimeout(2*time.Second),
+		),
+		sdktrace.WithResource(resource.Default()),
+	)
+
+	otel.SetTracerProvider(tp)
+	return tp.Shutdown, nil
+}
+
 func errorAttrs(errObj error) []slog.Attr {
 	// 1. Always grab the base error message
 	attrs := []slog.Attr{
@@ -223,3 +257,4 @@ func errorAttrs(errObj error) []slog.Attr {
 
 	return attrs
 }
+

@@ -21,7 +21,6 @@ import (
 	pkgerr "github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-	"golang.org/x/crypto/bcrypt"
 )
 
 const shortURLLen = len("http://localhost:8080/") + 6
@@ -99,26 +98,24 @@ func (s *server) handlerRedirect(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, store.ErrNotFound) {
 			httpError(ctx, w, http.StatusNotFound, errors.New("not found"))
 		} else {
-			s.logger.Error("failed to lookup URL",
-			"error", err,
-		)
-		httpError(ctx, w, http.StatusInternalServerError, errors.New("internal server error"))
+			s.logger.Error("failed to lookup URL")
+			httpError(ctx, w, http.StatusInternalServerError, errors.New("internal server error"))
+		}
+		return
 	}
-	return
+
+	if err := checkDestination(ctx, longURL); err != nil {
+		httpError(ctx, w, http.StatusBadGateway, errors.New("bad gateway"))
+		return
+	}
+
+	redirectsMu.Lock()
+	redirects = append(redirects, strings.Repeat(longURL, 1024))
+	redirectsMu.Unlock()
+
+	http.Redirect(w, r, longURL, http.StatusFound)
 }
 
-_, _ = bcrypt.GenerateFromPassword([]byte(longURL), bcrypt.DefaultCost)
-if err := checkDestination(ctx, longURL); err != nil {
-	httpError(ctx, w, http.StatusBadGateway, errors.New("bad gateway"))
-	return
-}
-
-redirectsMu.Lock()
-redirects = append(redirects, strings.Repeat(longURL, 1024))
-redirectsMu.Unlock()
-
-http.Redirect(w, r, longURL, http.StatusFound)
-}
 
 func (s *server) handlerListURLs(w http.ResponseWriter, r *http.Request) {
 	ctx, span := tracer.Start(r.Context(), "handler.list_url")

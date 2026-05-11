@@ -24,6 +24,7 @@ import (
 	"boot.dev/linko/internal/store"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -222,6 +223,8 @@ func replaceAttr(groups []string, a slog.Attr) slog.Attr {
 	return a
 }
 
+var tracer trace.Tracer
+
 func initTracing(ctx context.Context) (func(context.Context) error, error) {
 	exp, err := otlptracegrpc.New(ctx)
 	if err != nil {
@@ -236,6 +239,7 @@ func initTracing(ctx context.Context) (func(context.Context) error, error) {
 	)
 
 	otel.SetTracerProvider(tp)
+	tracer = tp.Tracer("boot.dev/linko")
 	return tp.Shutdown, nil
 }
 
